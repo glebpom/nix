@@ -17,7 +17,8 @@ use libc::user_regs_struct;
 
 cfg_if! {
     if #[cfg(any(all(target_os = "linux", target_arch = "s390x"),
-                 all(target_os = "linux", target_env = "gnu")))] {
+                 all(target_os = "linux", target_env = "gnu"),
+                 all(target_os = "linux", target_env = "uclibc", target_arch = "mips")))] {
         #[doc(hidden)]
         pub type RequestType = ::libc::c_uint;
     } else {
