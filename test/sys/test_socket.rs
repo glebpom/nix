@@ -169,7 +169,7 @@ mod recvfrom {
 
     const MSG: &'static [u8] = b"Hello, World!";
 
-    fn sendrecv<F>(rsock: RawFd, ssock: RawFd, f: F) -> Option<SockAddr>
+    fn sendrecv<F>(rsock: RawFd, ssock: RawFd, max_recv_once: Option<usize>, f: F) -> Option<SockAddr>
         where F: Fn(RawFd, &[u8], MsgFlags) -> Result<usize> + Send + 'static
     {
         let mut buf: [u8; 13] = [0u8; 13];
@@ -185,6 +185,9 @@ mod recvfrom {
 
         while l < std::mem::size_of_val(MSG) {
             let (len, from_) = recvfrom(rsock, &mut buf[l..]).unwrap();
+            if let Some(max) = max_recv_once {
+                assert!(len <= max);
+            }
             from = from_;
             l += len;
         }
@@ -198,7 +201,7 @@ mod recvfrom {
         let (fd2, fd1) = socketpair(AddressFamily::Unix, SockType::Stream,
                                     None, SockFlag::empty()).unwrap();
         // Ignore from for stream sockets
-        let _ = sendrecv(fd1, fd2, |s, m, flags| {
+        let _ = sendrecv(fd1, fd2, None, |s, m, flags| {
             send(s, m, flags)
         });
     }
@@ -220,7 +223,7 @@ mod recvfrom {
             SockFlag::empty(),
             None,
         ).expect("send socket failed");
-        let from = sendrecv(rsock, ssock, move |s, m, flags| {
+        let from = sendrecv(rsock, ssock, None, move |s, m, flags| {
             sendto(s, m, &sock_addr, flags)
         });
         // UDP sockets should set the from address
@@ -252,7 +255,7 @@ mod recvfrom {
             None,
         ).expect("send socket failed");
 
-        let from = sendrecv(rsock, ssock, move |s, m, flags| {
+        let from = sendrecv(rsock, ssock, None, move |s, m, flags| {
             let iov = [IoVec::from_slice(m)];
             let mut msgs = std::collections::LinkedList::new();
             msgs.push_back(
@@ -265,6 +268,10 @@ mod recvfrom {
                 msgs.push_back(
                     SendMmsgData {
                         iov: &iov,
+                        // Additionally test that cmsg generation works correctly (only under linux with UdpGsoSegments cmsg)
+                        #[cfg(target_os = "linux")]
+                        cmsgs: &[ControlMessage::UdpGsoSegments(&2)],
+                        #[cfg(not(target_os = "linux"))]
                         cmsgs: &[],
                         addr: Some(&sock_addr2),
                     }
@@ -332,7 +339,7 @@ mod recvfrom {
         let res = recvmmsg(rsock, &mut msgs, MsgFlags::empty(), None).expect("recvmmsg");
         assert_eq!(res.len(), 2);
 
-        for RecvMsg { address, bytes, ..} in res.into_iter() {
+        for RecvMsg { address, bytes, .. } in res.into_iter() {
             assert_eq!(AddressFamily::Inet, address.unwrap().family());
             assert_eq!(2, bytes);
         }
@@ -340,6 +347,74 @@ mod recvfrom {
         assert_eq!(&rec_buf2[..2], b"12");
 
         send_thread.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    mod udp_offload {
+        use super::*;
+        use nix::sys::uio::IoVec;
+        use nix::sys::socket::sockopt::{UdpGroSegment, UdpGsoSegment};
+
+        #[test]
+        pub fn gso() {
+            let std_sa = SocketAddr::from_str("127.0.0.1:6791").unwrap();
+            let inet_addr = InetAddr::from_std(&std_sa);
+            let sock_addr = SockAddr::new_inet(inet_addr);
+            let rsock = socket(AddressFamily::Inet,
+                               SockType::Datagram,
+                               SockFlag::empty(),
+                               None
+            ).unwrap();
+
+            setsockopt(rsock, UdpGsoSegment, &2).expect("setsockopt UDP_SEGMENT failed");
+
+            bind(rsock, &sock_addr).unwrap();
+            let ssock = socket(
+                AddressFamily::Inet,
+                SockType::Datagram,
+                SockFlag::empty(),
+                None,
+            ).expect("send socket failed");
+
+            let from = sendrecv(rsock, ssock, Some(2), move |s, m, flags| {
+                let iov = [IoVec::from_slice(m)];
+                let cmsg = ControlMessage::UdpGsoSegments(&2);
+                sendmsg(s, &iov, &[cmsg], flags, Some(&sock_addr))
+            });
+            // UDP sockets should set the from address
+            assert_eq!(AddressFamily::Inet, from.unwrap().family());
+        }
+
+        #[test]
+        pub fn gro() {
+            let std_sa = SocketAddr::from_str("127.0.0.1:6792").unwrap();
+            let inet_addr = InetAddr::from_std(&std_sa);
+            let sock_addr = SockAddr::new_inet(inet_addr);
+            let rsock = socket(AddressFamily::Inet,
+                               SockType::Datagram,
+                               SockFlag::empty(),
+                               None
+            ).unwrap();
+
+            setsockopt(rsock, UdpGroSegment, &true).expect("setsockopt UDP_GRO failed");
+
+            bind(rsock, &sock_addr).unwrap();
+            let ssock = socket(
+                AddressFamily::Inet,
+                SockType::Datagram,
+                SockFlag::empty(),
+                None,
+            ).expect("send socket failed");
+
+            let from = sendrecv(rsock, ssock, None, move |s, m, flags| {
+                let iov = [IoVec::from_slice(m)];
+                let cmsg = ControlMessage::UdpGsoSegments(&2);
+                sendmsg(s, &iov, &[cmsg], flags, Some(&sock_addr))
+            });
+
+            // UDP sockets should set the from address
+            assert_eq!(AddressFamily::Inet, from.unwrap().family());
+        }
     }
 }
 
