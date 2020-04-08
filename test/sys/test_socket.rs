@@ -226,6 +226,121 @@ mod recvfrom {
         // UDP sockets should set the from address
         assert_eq!(AddressFamily::Inet, from.unwrap().family());
     }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    pub fn udp_sendmmsg() {
+        use nix::sys::uio::IoVec;
+
+        let std_sa = SocketAddr::from_str("127.0.0.1:6793").unwrap();
+        let std_sa2 = SocketAddr::from_str("127.0.0.1:6794").unwrap();
+        let inet_addr = InetAddr::from_std(&std_sa);
+        let inet_addr2 = InetAddr::from_std(&std_sa2);
+        let sock_addr = SockAddr::new_inet(inet_addr);
+        let sock_addr2 = SockAddr::new_inet(inet_addr2);
+
+        let rsock = socket(AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None
+        ).unwrap();
+        bind(rsock, &sock_addr).unwrap();
+        let ssock = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        ).expect("send socket failed");
+
+        let from = sendrecv(rsock, ssock, move |s, m, flags| {
+            let iov = [IoVec::from_slice(m)];
+            let mut msgs = std::collections::LinkedList::new();
+            msgs.push_back(
+                SendMmsgData {
+                    iov: &iov,
+                    cmsgs: &[],
+                    addr: Some(&sock_addr),
+                });
+            for _ in 0..15 {
+                msgs.push_back(
+                    SendMmsgData {
+                        iov: &iov,
+                        cmsgs: &[],
+                        addr: Some(&sock_addr2),
+                    }
+                );
+            }
+            sendmmsg(s, &msgs, flags).map(move |(sent_messages, sent_bytes)| {
+                assert!(sent_messages >= 1);
+                assert_eq!(sent_bytes.len(), sent_messages);
+                for sent in &sent_bytes {
+                    assert_eq!(*sent, m.len());
+                }
+                sent_messages
+            })
+        });
+        // UDP sockets should set the from address
+        assert_eq!(AddressFamily::Inet, from.unwrap().family());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    pub fn udp_recvmmsg() {
+        use nix::sys::uio::IoVec;
+        use nix::sys::socket::{MsgFlags, recvmmsg};
+
+        let std_sa = SocketAddr::from_str("127.0.0.1:6798").unwrap();
+        let inet_addr = InetAddr::from_std(&std_sa);
+        let sock_addr = SockAddr::new_inet(inet_addr);
+
+        let rsock = socket(AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None
+        ).unwrap();
+        bind(rsock, &sock_addr).unwrap();
+        let ssock = socket(
+            AddressFamily::Inet,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        ).expect("send socket failed");
+
+        let send_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                sendto(ssock, &b"12"[..], &sock_addr, MsgFlags::empty()).unwrap();
+            }
+        });
+
+        let mut msgs = std::collections::LinkedList::new();
+        let mut rec_buf1 = [0u8; 32];
+        let mut rec_buf2 = [0u8; 32];
+        let iov1 = [IoVec::from_mut_slice(&mut rec_buf1[..])];
+        let iov2 = [IoVec::from_mut_slice(&mut rec_buf2[..])];
+        msgs.push_back(
+            RecvMmsgData {
+                iov: &iov1,
+                cmsg_buffer: None,
+            }
+        );
+        msgs.push_back(
+            RecvMmsgData {
+                iov: &iov2,
+                cmsg_buffer: None,
+            }
+        );
+        let res = recvmmsg(rsock, &mut msgs, MsgFlags::empty(), None).expect("recvmmsg");
+        assert_eq!(res.len(), 2);
+
+        for RecvMsg { address, bytes, ..} in res.into_iter() {
+            assert_eq!(AddressFamily::Inet, address.unwrap().family());
+            assert_eq!(2, bytes);
+        }
+        assert_eq!(&rec_buf1[..2], b"12");
+        assert_eq!(&rec_buf2[..2], b"12");
+
+        send_thread.join().unwrap();
+    }
 }
 
 // Test error handling of our recvmsg wrapper

@@ -50,6 +50,7 @@ pub use libc::{
 // Needed by the cmsg_space macro
 #[doc(hidden)]
 pub use libc::{c_uint, CMSG_SPACE};
+use std::mem::MaybeUninit;
 
 /// These constants are used to specify the communication semantics
 /// when creating a socket with [`socket()`](fn.socket.html)
@@ -763,61 +764,276 @@ impl<'a> ControlMessage<'a> {
 pub fn sendmsg(fd: RawFd, iov: &[IoVec<&[u8]>], cmsgs: &[ControlMessage],
                flags: MsgFlags, addr: Option<&SockAddr>) -> Result<usize>
 {
+    let mut mhdr = mem::MaybeUninit::<msghdr>::zeroed();
+
     let capacity = cmsgs.iter().map(|c| c.space()).sum();
 
     // First size the buffer needed to hold the cmsgs.  It must be zeroed,
     // because subsequent code will not clear the padding bytes.
-    let cmsg_buffer = vec![0u8; capacity];
+    let mut cmsg_buffer = vec![0u8; capacity];
+
+    unsafe { send_pack_mhdr(mhdr.as_mut_ptr(), &mut cmsg_buffer[..], iov, cmsgs, addr) };
+
+    let mhdr = unsafe { mhdr.assume_init() };
+
+    let ret = unsafe { libc::sendmsg(fd, &mhdr, flags.bits()) };
+
+    Errno::result(ret).map(|r| r as usize)
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Debug)]
+pub struct SendMmsgData<'a> {
+    pub iov: &'a [IoVec<&'a [u8]>],
+    pub cmsgs: &'a [ControlMessage<'a>],
+    pub addr: Option<&'a SockAddr>,
+}
+
+/// An extension of `sendmsg`` that allows the caller to transmit multiple
+/// messages on a socket using a single system call.  (This has performance
+/// benefits for some applications.). Supported on Linux and FreeBSD
+///
+/// Allocations are performed for cmsgs and to build `msghdr` buffer
+///
+/// # Arguments
+///
+/// * `fd`:             Socket file descriptor
+/// * `data`:           Struct that implements `IntoIterator` with `SendMmsgData` items
+/// * `flags`:          Optional flags passed directly to the operating system.
+///
+/// # References
+/// [sendmmsg(2)](http://man7.org/linux/man-pages/man2/sendmmsg.2.html)
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn sendmmsg<'a>(fd: RawFd, data: impl std::iter::IntoIterator<Item=&'a SendMmsgData<'a>>, flags: MsgFlags) -> Result<(usize, Vec<usize>)>
+{
+    let iter = data.into_iter();
+
+    let (min_size, max_size) = iter.size_hint();
+    let reserve_items = max_size.unwrap_or(min_size);
+
+    let mut output: Vec<MaybeUninit<libc::mmsghdr>> = vec![MaybeUninit::zeroed(); reserve_items];
+
+    let mut cmsgs_buffer = vec![0u8; 0];
+
+    iter.enumerate().for_each(|(i, d)| {
+        if output.len() < i {
+            output.resize(i, MaybeUninit::zeroed());
+        }
+
+        let element = &mut output[i];
+
+        let cmsgs_start = cmsgs_buffer.len();
+        let cmsgs_required_capacity: usize = d.cmsgs.iter().map(|c| c.space()).sum();
+        let cmsgs_buffer_need_capacity = cmsgs_start + cmsgs_required_capacity;
+        cmsgs_buffer.resize(cmsgs_buffer_need_capacity, 0);
+
+        unsafe { send_pack_mhdr(&mut (*element.as_mut_ptr()).msg_hdr, &mut cmsgs_buffer[cmsgs_start..], d.iov, d.cmsgs, d.addr) };
+    });
+
+    let mut initialized_data = unsafe { mem::transmute::<_, Vec<libc::mmsghdr>>(output) };
+
+    let ret = unsafe { libc::sendmmsg(fd, initialized_data.as_mut_ptr(), initialized_data.len() as u32, flags.bits()) };
+
+    let sent_messages = Errno::result(ret)? as usize;
+    let mut sent_bytes = Vec::with_capacity(sent_messages);
+    unsafe { sent_bytes.set_len(sent_messages) };
+
+    for i in 0..sent_messages {
+        sent_bytes[i] = initialized_data[i].msg_len as usize;
+    }
+
+    Ok((sent_messages, sent_bytes))
+}
+
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Debug)]
+pub struct RecvMmsgData<'a> {
+    pub iov: &'a [IoVec<&'a mut [u8]>],
+    pub cmsg_buffer: Option<&'a mut Vec<u8>>,
+}
+
+/// An extension of recvmsg(2) that allows the caller to receive multiple
+/// messages from a socket using a single system call.  (This has
+/// performance benefits for some applications.)
+///
+/// `iov` and `cmsg_buffer` should be constucted similarly to recvmsg
+///
+/// Multiple allocations are performed
+///
+/// # Arguments
+///
+/// * `fd`:             Socket file descriptor
+/// * `data`:           Struct that implements `IntoIterator` with `RecvMmsgData` items
+/// * `flags`:          Optional flags passed directly to the operating system.
+///
+/// # RecvMmsgData
+///
+/// * `iov`:            Scatter-gather list of buffers to receive the message
+/// * `cmsg_buffer`:    Space to receive ancillary data.  Should be created by
+///                     [`cmsg_space!`](macro.cmsg_space.html)
+///
+/// # References
+/// [recvmmsg(2)](http://man7.org/linux/man-pages/man2/recvmmsg.2.html)
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn recvmmsg<'a>(fd: RawFd,
+                    data: impl std::iter::IntoIterator<Item=&'a mut RecvMmsgData<'a>>,
+                    flags: MsgFlags, timeout: Option<crate::sys::time::TimeSpec>) -> Result<Vec<RecvMsg<'a>>>
+{
+    let iter = data.into_iter();
+
+    let (min_size, max_size) = iter.size_hint();
+    let reserve_items = max_size.unwrap_or(min_size);
+
+    let mut output: Vec<MaybeUninit<libc::mmsghdr>> = vec![MaybeUninit::zeroed(); reserve_items];
+    let mut address: Vec<MaybeUninit<sockaddr_storage>> = vec![MaybeUninit::uninit(); reserve_items];
+
+    let results: Vec<_> = iter.enumerate().map(|(i, d)| {
+        if output.len() < i {
+            output.resize(i, MaybeUninit::zeroed());
+            address.resize(i, MaybeUninit::uninit());
+        }
+
+        let element = &mut output[i];
+
+        let msg_controllen = unsafe {
+            recv_pack_mhdr(
+                &mut (*element.as_mut_ptr()).msg_hdr,
+                d.iov,
+                &mut d.cmsg_buffer,
+                &mut address[i]
+            )
+        };
+
+        (msg_controllen as usize, &mut d.cmsg_buffer)
+    }).collect();
+
+    let mut initialized_data = unsafe { mem::transmute::<_, Vec<libc::mmsghdr>>(output) };
+
+    let timeout = if let Some(mut t) = timeout {
+        t.as_mut() as *mut libc::timespec
+    } else {
+        ptr::null_mut()
+    };
+
+    let ret = unsafe { libc::recvmmsg(fd, initialized_data.as_mut_ptr(), initialized_data.len() as u32, flags.bits(), timeout) };
+
+    let r = Errno::result(ret)?;
+
+    Ok(initialized_data
+        .into_iter()
+        .zip(address.into_iter())
+        .zip(results.into_iter())
+        .map(|((mmsghdr, address), (msg_controllen, cmsg_buffer))| {
+            unsafe {
+                recv_read_mhdr(
+                    mmsghdr.msg_hdr,
+                    r as isize,
+                    msg_controllen,
+                    address,
+                    cmsg_buffer
+                )
+            }
+        })
+        .collect())
+}
+
+unsafe fn recv_read_mhdr<'a, 'b>(
+    mhdr: msghdr,
+    r: isize,
+    msg_controllen: usize,
+    address: MaybeUninit<sockaddr_storage>,
+    cmsg_buffer: &'a mut Option<&'b mut Vec<u8>>
+) -> RecvMsg<'b> {
+    let cmsghdr = {
+        if mhdr.msg_controllen > 0 {
+            // got control message(s)
+            cmsg_buffer
+                .as_mut()
+                .unwrap()
+                .set_len(mhdr.msg_controllen as usize);
+            debug_assert!(!mhdr.msg_control.is_null());
+            debug_assert!(msg_controllen >= mhdr.msg_controllen as usize);
+            CMSG_FIRSTHDR(&mhdr as *const msghdr)
+        } else {
+            ptr::null()
+        }.as_ref()
+    };
+
+    let address = sockaddr_storage_to_addr(
+        &address.assume_init(),
+         mhdr.msg_namelen as usize
+    ).ok();
+
+    RecvMsg {
+        bytes: r as usize,
+        cmsghdr,
+        address,
+        flags: MsgFlags::from_bits_truncate(mhdr.msg_flags),
+        mhdr,
+    }
+}
+
+unsafe fn recv_pack_mhdr(out: *mut msghdr, iov: &[IoVec<&mut [u8]>], cmsg_buffer: &mut Option<&mut Vec<u8>>, address: &mut mem::MaybeUninit<sockaddr_storage>) -> usize {
+    let (msg_control, msg_controllen) = cmsg_buffer.as_mut()
+        .map(|v| (v.as_mut_ptr(), v.capacity()))
+        .unwrap_or((ptr::null_mut(), 0));
+
+    (*out).msg_name = address.as_mut_ptr() as *mut c_void;
+    (*out).msg_namelen = mem::size_of::<sockaddr_storage>() as socklen_t;
+    (*out).msg_iov = iov.as_ptr() as *mut iovec;
+    (*out).msg_iovlen = iov.len() as _;
+    (*out).msg_control = msg_control as *mut c_void;
+    (*out).msg_controllen = msg_controllen as _;
+    (*out).msg_flags = 0;
+
+    msg_controllen
+}
+
+
+unsafe fn send_pack_mhdr(out: *mut msghdr, cmsg_buffer: &mut [u8], iov: &[IoVec<&[u8]>], cmsgs: &[ControlMessage], addr: Option<&SockAddr>) {
+    let cmsg_capacity = cmsg_buffer.len();
 
     // Next encode the sending address, if provided
     let (name, namelen) = match addr {
         Some(addr) => {
-            let (x, y) = unsafe { addr.as_ffi_pair() };
+            let (x, y) = addr.as_ffi_pair();
             (x as *const _, y)
         },
         None => (ptr::null(), 0),
     };
 
     // The message header must be initialized before the individual cmsgs.
-    let cmsg_ptr = if capacity > 0 {
+    let cmsg_ptr = if cmsg_capacity > 0 {
         cmsg_buffer.as_ptr() as *mut c_void
     } else {
         ptr::null_mut()
     };
 
-    let mhdr = unsafe {
-        // Musl's msghdr has private fields, so this is the only way to
-        // initialize it.
-        let mut mhdr = mem::MaybeUninit::<msghdr>::zeroed();
-        let p = mhdr.as_mut_ptr();
-        (*p).msg_name = name as *mut _;
-        (*p).msg_namelen = namelen;
-        // transmute iov into a mutable pointer.  sendmsg doesn't really mutate
-        // the buffer, but the standard says that it takes a mutable pointer
-        (*p).msg_iov = iov.as_ptr() as *mut _;
-        (*p).msg_iovlen = iov.len() as _;
-        (*p).msg_control = cmsg_ptr;
-        (*p).msg_controllen = capacity as _;
-        (*p).msg_flags = 0;
-        mhdr.assume_init()
-    };
+    // Musl's msghdr has private fields, so this is the only way to
+    // initialize it.
+    (*out).msg_name = name as *mut _;
+    (*out).msg_namelen = namelen;
+    // transmute iov into a mutable pointer.  sendmsg doesn't really mutate
+    // the buffer, but the standard says that it takes a mutable pointer
+    (*out).msg_iov = iov.as_ptr() as *mut _;
+    (*out).msg_iovlen = iov.len() as _;
+    (*out).msg_control = cmsg_ptr;
+    (*out).msg_controllen = cmsg_capacity as _;
+    (*out).msg_flags = 0;
 
     // Encode each cmsg.  This must happen after initializing the header because
     // CMSG_NEXT_HDR and friends read the msg_control and msg_controllen fields.
     // CMSG_FIRSTHDR is always safe
-    let mut pmhdr: *mut cmsghdr = unsafe{CMSG_FIRSTHDR(&mhdr as *const msghdr)};
+    let mut pmhdr: *mut cmsghdr = CMSG_FIRSTHDR(out);
     for cmsg in cmsgs {
         assert_ne!(pmhdr, ptr::null_mut());
         // Safe because we know that pmhdr is valid, and we initialized it with
         // sufficient space
-        unsafe { cmsg.encode_into(pmhdr) };
+        cmsg.encode_into(pmhdr);
         // Safe because mhdr is valid
-        pmhdr = unsafe{CMSG_NXTHDR(&mhdr as *const msghdr, pmhdr)};
+        pmhdr = CMSG_NXTHDR(out, pmhdr);
     }
-
-    let ret = unsafe { libc::sendmsg(fd, &mhdr, flags.bits()) };
-
-    Errno::result(ret).map(|r| r as usize)
 }
 
 /// Receive message in scatter-gather vectors from a socket, and
@@ -834,62 +1050,22 @@ pub fn sendmsg(fd: RawFd, iov: &[IoVec<&[u8]>], cmsgs: &[ControlMessage],
 ///
 /// # References
 /// [recvmsg(2)](http://pubs.opengroup.org/onlinepubs/9699919799/functions/recvmsg.html)
-pub fn recvmsg<'a>(fd: RawFd, iov: &[IoVec<&mut [u8]>],
+pub fn recvmsg<'a>(fd: RawFd, iov: &'a [IoVec<&'a mut [u8]>],
                    mut cmsg_buffer: Option<&'a mut Vec<u8>>,
                    flags: MsgFlags) -> Result<RecvMsg<'a>>
 {
+    let mut out = mem::MaybeUninit::<msghdr>::zeroed();
     let mut address = mem::MaybeUninit::uninit();
-    let (msg_control, msg_controllen) = cmsg_buffer.as_mut()
-        .map(|v| (v.as_mut_ptr(), v.capacity()))
-        .unwrap_or((ptr::null_mut(), 0));
-    let mut mhdr = {
-        unsafe {
-            // Musl's msghdr has private fields, so this is the only way to
-            // initialize it.
-            let mut mhdr = mem::MaybeUninit::<msghdr>::zeroed();
-            let p = mhdr.as_mut_ptr();
-            (*p).msg_name = address.as_mut_ptr() as *mut c_void;
-            (*p).msg_namelen = mem::size_of::<sockaddr_storage>() as socklen_t;
-            (*p).msg_iov = iov.as_ptr() as *mut iovec;
-            (*p).msg_iovlen = iov.len() as _;
-            (*p).msg_control = msg_control as *mut c_void;
-            (*p).msg_controllen = msg_controllen as _;
-            (*p).msg_flags = 0;
-            mhdr.assume_init()
-        }
-    };
+
+    let msg_controllen = unsafe { recv_pack_mhdr(out.as_mut_ptr(), iov, &mut cmsg_buffer, &mut address) };
+
+    let mut mhdr = unsafe { out.assume_init() };
 
     let ret = unsafe { libc::recvmsg(fd, &mut mhdr, flags.bits()) };
 
-    Errno::result(ret).map(|r| {
-        let cmsghdr = unsafe {
-            if mhdr.msg_controllen > 0 {
-                // got control message(s)
-                cmsg_buffer
-                    .as_mut()
-                    .unwrap()
-                    .set_len(mhdr.msg_controllen as usize);
-                debug_assert!(!mhdr.msg_control.is_null());
-                debug_assert!(msg_controllen >= mhdr.msg_controllen as usize);
-                CMSG_FIRSTHDR(&mhdr as *const msghdr)
-            } else {
-                ptr::null()
-            }.as_ref()
-        };
+    let r = Errno::result(ret)?;
 
-        let address = unsafe {
-            sockaddr_storage_to_addr(&address.assume_init(),
-                                     mhdr.msg_namelen as usize
-            ).ok()
-        };
-        RecvMsg {
-            bytes: r as usize,
-            cmsghdr,
-            address,
-            flags: MsgFlags::from_bits_truncate(mhdr.msg_flags),
-            mhdr,
-        }
-    })
+    Ok(unsafe { recv_read_mhdr(mhdr, r, msg_controllen, address, &mut cmsg_buffer) })
 }
 
 
